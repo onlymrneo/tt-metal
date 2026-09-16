@@ -4,7 +4,7 @@
 """Host-side guards for the SFPU accuracy budget registry.
 
 No kernel, no device: this is a table and a resolution rule. Both need guarding for the
-same reason ``sfpu_domains`` does — the rule reduces a four-dimensional lookup to "most
+same reason ``sfpu_domains`` does — the rule reduces a five-dimensional lookup to "most
 specific key wins", and a budget resolved from the wrong key is a silently wrong gate, not
 an error. A test that reads a budget is worth more than one that reviews the table.
 
@@ -609,23 +609,27 @@ def _every_variant(op):
     """Every contract an op can resolve to, across the whole keyed variant space.
 
     Passing only ``output_format`` is not enough: by the ``matches()`` rule an unset
-    caller dimension cannot match a key that sets one, so any ``BudgetKey(arch=...)`` or
-    ``BudgetKey(dest_acc=...)`` entry is invisible to such a query — which is exactly the
-    growth path this file advertises, and would hide a wide budget from the guards below.
+    caller dimension cannot match a key that sets one, so any ``BudgetKey(arch=...)``,
+    ``BudgetKey(dest_acc=...)`` or ``BudgetKey(input_format=...)`` entry is invisible to
+    such a query. The last one is not hypothetical — every one of the enrolled
+    transcendental entries pins ``input_format``, so a query without it dropped all 19 of
+    those ops out of the guards below and left
+    ``test_no_budget_exceeds_its_formats_meaningful_ceiling`` covering 9 ops instead of 28.
     """
     for fmt in ULP_CAPABLE_FORMATS:
-        for approx_mode in list(ApproximationMode) + [None]:
-            for dest_acc in list(DestAccumulation) + [None]:
-                for (
-                    arch
-                ) in ChipArchitecture:  # arch is required; None is unrepresentable
-                    yield fmt, accuracy_contract(
-                        op,
-                        output_format=fmt,
-                        approx_mode=approx_mode,
-                        dest_acc=dest_acc,
-                        arch=arch,
-                    )
+        for input_format in list(ULP_CAPABLE_FORMATS) + [None]:
+            for approx_mode in list(ApproximationMode) + [None]:
+                for dest_acc in list(DestAccumulation) + [None]:
+                    # arch is required; None is unrepresentable.
+                    for arch in ChipArchitecture:
+                        yield fmt, accuracy_contract(
+                            op,
+                            output_format=fmt,
+                            input_format=input_format,
+                            approx_mode=approx_mode,
+                            dest_acc=dest_acc,
+                            arch=arch,
+                        )
 
 
 @pytest.mark.parametrize("op", EXACT_BY_CONSTRUCTION, ids=lambda op: op.name)
