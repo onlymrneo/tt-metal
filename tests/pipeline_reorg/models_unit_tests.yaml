@@ -704,7 +704,12 @@
 
 - name: Qwen3-32B unit tests (Galaxy)
   cmd: |
-    unset TT_METAL_WATCHER  # blocked by #50886
+    export TT_METAL_WATCHER=30
+    # Watcher instrumentation on ethernet cores pushes the fabric program to 27328 bytes
+    # against a 26624 byte ACTIVE_ETH kernel config buffer, so open_mesh_device throws in
+    # FabricFirmwareInitializer::compile_and_configure_fabric() and no test runs. Worker
+    # cores stay watched, which is where the faults under #50886 have been.
+    export TT_METAL_WATCHER_DISABLE_ETH=1
     export HF_MODEL=Qwen/Qwen3-32B TT_CACHE_PATH=/mnt/MLPerf/huggingface/tt_cache/Qwen/Qwen3-32B
     export QWEN_BH_PREFETCHER=1  # opt-in BH dram_prefetcher path (no-op on WH)
     pytest --timeout 60 models/tt_transformers/tests/test_attention_utils.py
