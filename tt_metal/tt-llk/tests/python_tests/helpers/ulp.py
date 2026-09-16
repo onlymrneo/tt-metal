@@ -83,6 +83,31 @@ ULP_FORMATS: Tuple[DataFormat, ...] = (
     DataFormat.Float32,
 )
 
+# Formats with no float dtype of their own that are still gated in a *proxy* format's ULP
+# space. Bfp8_b carries 7 magnitude bits per element, the same mantissa width as bfloat16,
+# so one step of the bf16 lattice is one step of the Bfp8_b lattice wherever the shared
+# block exponent is the one bf16 would have used. This is ttnn's choice — its
+# ``assert_with_ulp`` maps ``bfloat8_b`` to ``bfloat16`` — and it costs nothing here
+# because ``passed_test`` has already cast a Bfp8_b tensor to bfloat16 before it compares.
+#
+# The caveat to budget for: where a block spans a wide magnitude range, its small elements
+# are quantized by the block exponent far more coarsely than bf16 would quantize them, and
+# a bf16 step count reads that legal quantization as a multi-step error. Those are the
+# small-magnitude lanes, so ``near_zero_atol`` is what absorbs them; a Bfp8_b budget
+# without that floor has to be loose enough to cover the widest block in the stimulus.
+#
+# Bfp4_b (3 magnitude bits) and Bfp2_b (1) are deliberately absent: their lattices are so
+# much coarser than bf16's that a bf16 step count would read every legal quantization as a
+# 16- or 64-step error. They keep ``_bfp_block_aware_compare``.
+_ULP_PROXY_DTYPES: Dict[DataFormat, torch.dtype] = {
+    DataFormat.Bfp8_b: torch.bfloat16,
+}
+
+#: Lanes whose golden is below this fraction of the tensor's dynamic range are the ones a
+#: ``near_zero_atol`` floor may rescue. ttnn's ``measure_ulp_with_near_zero_atol`` uses the
+#: same 1%: deliberately simple and scale-relative rather than tuned per op.
+NEAR_ZERO_FRACTION = 1e-2
+
 #: Returned for any lane where either side is NaN — NaN has no place in the value order.
 #: A caller must never compare this against a budget directly: ``-1 <= max_ulp`` is true
 #: for every budget. Use :func:`within_ulp`, or gate on ``dist >= 0`` yourself.
@@ -191,11 +216,14 @@ def ulp_dtype(fmt: DataFormat) -> torch.dtype:
     """
     if fmt in ULP_FORMATS:
         return format_dict[fmt]
+    if fmt in _ULP_PROXY_DTYPES:
+        return _ULP_PROXY_DTYPES[fmt]
     raise ValueError(
         f"{fmt.name} has no per-element ULP. ULP is defined for "
-        f"{', '.join(f.name for f in ULP_FORMATS)}; the block floats (Bfp*, Mx*) share a "
-        "block exponent and keep their lattice compare in utils.py, and the integer "
-        "formats want bit equality."
+        f"{', '.join(f.name for f in ULP_FORMATS)}, and for "
+        f"{', '.join(f.name for f in _ULP_PROXY_DTYPES)} in a proxy format's space; the "
+        "coarser block floats and the MX formats share a block exponent and keep their "
+        "lattice compare in utils.py, and the integer formats want bit equality."
     )
 
 
@@ -310,6 +338,63 @@ def nonfinite_mismatches(golden: torch.Tensor, result: torch.Tensor) -> torch.Te
         | (golden_inf ^ result_inf)
         | (golden_inf & result_inf & sign_differs)
     )
+
+
+def ulp_elementwise_valid(
+    golden: torch.Tensor,
+    result: torch.Tensor,
+    max_ulp: int,
+    *,
+    near_zero_atol: Optional[float] = None,
+    near_zero_fraction: float = NEAR_ZERO_FRACTION,
+    flush_subnormals: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-element ULP verdict, shaped like the mask ``passed_test`` already prints.
+
+    A lane is valid when the two sides agree about being non-finite **and** either
+
+    * they are within *max_ulp* representable steps of each other, or
+    * the lane is near zero and its absolute error is within *near_zero_atol*.
+
+    The non-finite rule is stricter than the metric on purpose. :func:`ulp_distance` gives
+    ``Inf`` a rank, one step past the largest finite, but an overflow to ``Inf`` where the
+    reference is finite is a different kind of wrong from being one step out, and the
+    tolerance gate this replaces already rejects it. Both-NaN lanes are valid, which is
+    the rule this harness has always used.
+
+    "Near zero" means ``|golden| < near_zero_fraction * max|finite golden|`` (every lane,
+    if the golden is all zeros). The floor is deliberately *not* applied at every
+    magnitude: an absolute tolerance at large magnitude is precisely the format- and
+    magnitude-blind gate a step count is meant to replace. It is here for the lanes where
+    the reference crosses zero — ``log`` near 1, ``expm1`` near 0, ``tanhshrink``, ``sin``
+    near π — where ``ulp(golden)`` collapses and any absolute error explodes into a step
+    count that says nothing about the kernel. Raising *max_ulp* instead would reopen the
+    hole across the whole domain.
+
+    Returns ``(is_valid, distance)``; the distance is handed back so a caller can report
+    the distribution without measuring twice.
+    """
+    distance = ulp_distance(golden, result, flush_subnormals=flush_subnormals)
+    both_nan = torch.isnan(golden) & torch.isnan(result)
+    in_budget = (distance >= 0) & (distance <= max_ulp)
+    valid = in_budget | both_nan
+
+    if near_zero_atol is not None:
+        finite_golden = golden[torch.isfinite(golden)]
+        if finite_golden.numel() == 0:
+            near_zero = torch.zeros_like(valid)
+        else:
+            dynamic_range = float(finite_golden.abs().max())
+            near_zero = (
+                torch.ones_like(valid)
+                if dynamic_range == 0.0
+                else golden.abs() < near_zero_fraction * dynamic_range
+            )
+        # In float32 so a bf16 comparison does not round the error into or out of budget.
+        absolute_error = (result.to(torch.float32) - golden.to(torch.float32)).abs()
+        valid = valid | (near_zero & (absolute_error <= near_zero_atol))
+
+    return valid & ~nonfinite_mismatches(golden, result), distance
 
 
 def ulp_stats(
@@ -458,6 +543,64 @@ def local_step(
     return float((upward - scalar).to(torch.float32))
 
 
+def nonfinite_disagreement_summary(
+    golden: torch.Tensor,
+    result: torch.Tensor,
+    fmt: Optional[DataFormat] = None,
+    *,
+    mask: Optional[torch.Tensor] = None,
+) -> Optional[str]:
+    """The first lane where the two sides disagree about being non-finite, or ``None``.
+
+    Needed because the step count cannot describe this failure: a NaN lane is
+    :data:`UNMEASURABLE` and drops out of the statistics, so a verdict that failed only
+    on a missing NaN reports "max 0 ULP (budget 0)" — true, and useless.
+    """
+    mismatched = nonfinite_mismatches(golden, result)
+    if mask is not None:
+        mismatched = mismatched & mask
+    if not bool(mismatched.any()):
+        return None
+    index = int(torch.nonzero(mismatched.reshape(-1), as_tuple=False)[0])
+    label = fmt.name if fmt is not None else str(golden.dtype)
+    return (
+        f"non-finite disagreement @ [{index}]: result "
+        f"{float(result.reshape(-1)[index])!r} vs golden "
+        f"{float(golden.reshape(-1)[index])!r} ({label}); "
+        f"{int(mismatched.sum())} such lane(s)"
+    )
+
+
+def ulp_verdict_message(
+    golden: torch.Tensor,
+    result: torch.Tensor,
+    distance: torch.Tensor,
+    fmt: Optional[DataFormat] = None,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    max_ulp: Optional[int] = None,
+    stats: Optional[Dict[str, Any]] = None,
+    flush_subnormals: Optional[bool] = None,
+) -> str:
+    """What a gate should log: the non-finite disagreement first, then the steps.
+
+    One builder for both callers, so the gate and :func:`within_ulp` cannot describe the
+    same verdict differently.
+    """
+    steps = ulp_failure_message(
+        golden,
+        result,
+        distance,
+        fmt,
+        mask=mask,
+        max_ulp=max_ulp,
+        stats=stats,
+        flush_subnormals=flush_subnormals,
+    )
+    disagreement = nonfinite_disagreement_summary(golden, result, fmt, mask=mask)
+    return steps if disagreement is None else f"{disagreement}\n  {steps}"
+
+
 def ulp_failure_message(
     golden: torch.Tensor,
     result: torch.Tensor,
@@ -594,25 +737,9 @@ def within_ulp(
             f"{tuple(golden.shape)}"
         )
     selected = torch.ones_like(golden, dtype=torch.bool) if mask is None else mask
-    # Positional agreement first, and no budget buys past it: a finite golden against an
-    # `Inf` result is one step apart in the value order (the module docstring's third
-    # bullet), but it is an overflow, not an inexact answer, so it is refused here rather
-    # than measured -- the same line `utils.py::_bfp_block_aware_compare` takes. The only
-    # `Inf` lane that reaches the distance is same-sign `Inf` against `Inf`, which is 0.
-    mismatched = nonfinite_mismatches(golden, result) & selected
-    if bool(mismatched.any()):
-        index = int(torch.nonzero(mismatched.reshape(-1), as_tuple=False)[0])
-        label = fmt.name if fmt is not None else str(golden.dtype)
-        return False, (
-            f"non-finite disagreement @ [{index}]: result "
-            f"{float(result.reshape(-1)[index])!r} vs golden "
-            f"{float(golden.reshape(-1)[index])!r} ({label})"
-        )
-
     distance = ulp_distance(golden, result, flush_subnormals=flush_subnormals)
     stats = ulp_stats(distance, selected)
-    ok = stats["worst_index"] is None or stats["max"] <= max_ulp
-    return ok, ulp_failure_message(
+    message = ulp_verdict_message(
         golden,
         result,
         distance,
@@ -622,3 +749,14 @@ def within_ulp(
         stats=stats,
         flush_subnormals=flush_subnormals,
     )
+
+    # Positional agreement is decisive, and no budget buys past it: a finite golden
+    # against an `Inf` result is one step apart in the value order (the module docstring's
+    # third bullet), but it is an overflow, not an inexact answer, so it is refused rather
+    # than measured -- the same line `utils.py::_bfp_block_aware_compare` takes. The only
+    # `Inf` lane that reaches the distance is same-sign `Inf` against `Inf`, which is 0.
+    if nonfinite_disagreement_summary(golden, result, fmt, mask=selected) is not None:
+        return False, message
+
+    ok = stats["worst_index"] is None or stats["max"] <= max_ulp
+    return ok, message

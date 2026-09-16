@@ -37,16 +37,20 @@ from helpers.ulp import (
     _MIN_LANES_FOR_P99,
     _ULP_DTYPES,
     MAX_MEANINGFUL_ULP,
+    NEAR_ZERO_FRACTION,
     ULP_FORMATS,
     UNMEASURABLE,
     _value_order_index,
     flushes_subnormals,
     local_step,
+    nonfinite_disagreement_summary,
     nonfinite_mismatches,
     ulp_distance,
     ulp_dtype,
+    ulp_elementwise_valid,
     ulp_failure_message,
     ulp_stats,
+    ulp_verdict_message,
     warn_if_threshold_unmeaningful,
     within_ulp,
 )
@@ -559,8 +563,8 @@ def test_ulp_dtype_maps_the_float_formats(fmt, expected):
 @pytest.mark.parametrize(
     "fmt",
     [
-        DataFormat.Bfp8_b,
         DataFormat.Bfp4_b,
+        DataFormat.Bfp2_b,
         DataFormat.MxFp8P,
         DataFormat.MxFp4,
         DataFormat.Int32,
@@ -568,13 +572,22 @@ def test_ulp_dtype_maps_the_float_formats(fmt, expected):
     ],
 )
 def test_ulp_dtype_rejects_formats_without_a_per_element_ulp(fmt):
-    """Rejected, not silently redirected: a block float's spacing is set by an exponent
-    shared across 16 elements, and ``Tf32`` is held in an fp32 container whose lattice is
-    not its own. A caller must not be able to think it has a gate it does not have."""
+    """Rejected, not silently redirected: Bfp4_b's 3 magnitude bits and Bfp2_b's 1 are so
+    much coarser than bf16 that a bf16 step count would read every legal quantization as a
+    16- or 64-step error, and ``Tf32`` is held in an fp32 container whose lattice is not
+    its own. A caller must not be able to think it has a gate it does not have."""
     with pytest.raises(  # allow-pytest.raises: no expect_error fixture in LLK suite
         ValueError, match="no per-element ULP"
     ):
         ulp_dtype(fmt)
+
+
+def test_bfp8_b_is_measured_in_bf16_space():
+    """Bfp8_b's 7 magnitude bits are bfloat16's mantissa width, so one bf16 step is one
+    Bfp8_b step wherever the block exponent is the one bf16 would have used. ttnn makes
+    the same choice, and ``passed_test`` has already cast the tensor to bfloat16."""
+    assert DataFormat.Bfp8_b not in ULP_FORMATS
+    assert ulp_dtype(DataFormat.Bfp8_b) == torch.bfloat16
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=str)
@@ -906,7 +919,7 @@ def test_the_finfo_max_fixup_carries_its_own_weight(dtype):
 
 @pytest.mark.parametrize(
     "fmt",
-    [DataFormat.Bfp8_b, DataFormat.Bfp4_b, DataFormat.MxFp8P, DataFormat.Tf32],
+    [DataFormat.Bfp4_b, DataFormat.Bfp2_b, DataFormat.MxFp8P, DataFormat.Tf32],
     ids=lambda f: f.name,
 )
 def test_within_ulp_refuses_a_format_with_no_per_element_ulp(fmt):
@@ -987,6 +1000,13 @@ def test_the_reported_step_above_a_power_of_two_is_unchanged():
     assert not ok
     assert f"{ABOVE_ONE:.6e}" in message
 
+def test_within_ulp_accepts_bfp8_b_in_its_proxy_space():
+    """``Bfp8_b`` is gated in bfloat16 step space, so unlike the coarser block floats it
+    is a format ``within_ulp`` may legitimately label a verdict with."""
+    values = torch.ones(4, dtype=torch.bfloat16)
+    ok, message = within_ulp(values, values.clone(), 0, fmt=DataFormat.Bfp8_b)
+    assert ok and "Bfp8_b" in message
+
 
 def test_within_ulp_still_works_without_a_format():
     values = torch.ones(4, dtype=torch.bfloat16)
@@ -1004,3 +1024,180 @@ def test_the_message_builder_can_reuse_stats_it_was_given():
     assert ulp_failure_message(
         golden, result, distance, DataFormat.Float16_b, stats=stats
     ) == ulp_failure_message(golden, result, distance, DataFormat.Float16_b)
+
+
+# The elementwise verdict the gate consumes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=str)
+def test_elementwise_valid_marks_only_the_out_of_budget_lanes(dtype):
+    golden = torch.ones(4, dtype=dtype)
+    result = torch.stack(
+        [
+            _t([1.0], dtype)[0],
+            _step_up(1.0, dtype, 1)[0],
+            _step_up(1.0, dtype, 2)[0],
+            _step_down(1.0, dtype, 3)[0],
+        ]
+    )
+    is_valid, distance = ulp_elementwise_valid(golden, result, 1)
+    assert distance.tolist() == [0, 1, 2, 3]
+    assert is_valid.tolist() == [True, True, False, False]
+
+
+def test_elementwise_valid_accepts_both_nan_and_rejects_a_missing_one():
+    nan = float("nan")
+    golden = torch.tensor([nan, nan, 1.0], dtype=torch.float32)
+    result = torch.tensor([nan, 1.0, nan], dtype=torch.float32)
+    is_valid, _ = ulp_elementwise_valid(golden, result, 0)
+    assert is_valid.tolist() == [True, False, False]
+
+
+def test_elementwise_valid_rejects_an_overflow_to_inf_even_though_it_ranks_one_step():
+    """The gate is stricter than the metric here, deliberately: ``ulp_distance`` ranks Inf
+    one step past the largest finite, but an overflow where the reference is finite is a
+    different kind of wrong, and the tolerance gate this replaces rejects it too."""
+    golden = torch.tensor([torch.finfo(torch.float32).max], dtype=torch.float32)
+    result = torch.tensor([float("inf")], dtype=torch.float32)
+    is_valid, distance = ulp_elementwise_valid(golden, result, 1)
+    assert int(distance[0]) == 1
+    assert is_valid.tolist() == [False]
+
+
+def test_near_zero_atol_rescues_a_cancellation_lane():
+    """The case the floor exists for: a golden that crosses zero, where ``ulp(golden)``
+    collapses and a tiny absolute error becomes an enormous step count."""
+    golden = torch.tensor([100.0, 1e-8], dtype=torch.float32)
+    result = torch.tensor([100.0, 2e-8], dtype=torch.float32)
+
+    is_valid, distance = ulp_elementwise_valid(golden, result, 4)
+    assert int(distance[1]) > 1000  # meaningless as a kernel verdict
+    assert is_valid.tolist() == [True, False]
+
+    is_valid, _ = ulp_elementwise_valid(golden, result, 4, near_zero_atol=1e-7)
+    assert is_valid.tolist() == [True, True]
+
+
+def test_near_zero_atol_does_not_loosen_the_large_magnitude_lanes():
+    """An atol applied at every magnitude is the format- and magnitude-blind gate the step
+    count replaces, so the floor must stay below the near-zero cut."""
+    golden = torch.tensor([100.0, 1e-8], dtype=torch.float32)
+    result = torch.tensor([100.5, 1e-8], dtype=torch.float32)
+    is_valid, _ = ulp_elementwise_valid(golden, result, 0, near_zero_atol=1.0)
+    assert is_valid.tolist() == [False, True]
+
+
+def test_near_zero_cut_is_a_fraction_of_the_tensors_dynamic_range():
+    dynamic_range = 100.0
+    just_below = dynamic_range * NEAR_ZERO_FRACTION * 0.9
+    just_above = dynamic_range * NEAR_ZERO_FRACTION * 1.1
+    golden = torch.tensor([dynamic_range, just_below, just_above], dtype=torch.float32)
+    result = golden.clone()
+    result[1] += 0.5
+    result[2] += 0.5
+    is_valid, _ = ulp_elementwise_valid(golden, result, 0, near_zero_atol=1.0)
+    assert is_valid.tolist() == [True, True, False]
+
+
+def test_near_zero_atol_covers_every_lane_of_an_all_zero_golden():
+    golden = torch.zeros(3, dtype=torch.float32)
+    result = torch.tensor([0.0, 1e-9, 1.0], dtype=torch.float32)
+    is_valid, _ = ulp_elementwise_valid(golden, result, 0, near_zero_atol=1e-8)
+    assert is_valid.tolist() == [True, True, False]
+
+
+def test_elementwise_valid_without_the_floor_is_the_plain_budget():
+    torch.manual_seed(0)
+    golden = torch.randn(128, dtype=torch.float32)
+    result = torch.nextafter(golden, torch.full_like(golden, float("inf")))
+    assert torch.all(ulp_elementwise_valid(golden, result, 1)[0])
+    assert not torch.any(ulp_elementwise_valid(golden, result, 0)[0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What a verdict says when the step count cannot describe the failure
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=str)
+def test_the_step_at_the_largest_finite_is_not_infinite(dtype):
+    """``nextafter`` from the largest finite goes to ``Inf``, so the naive difference is
+    infinite and a message about a failure at the top of the range reads "1 ULP = inf".
+    The binade is the same downward, so the step is the same size measured that way.
+    ttnn's ``ulp()`` carries the same ``finfo.max`` fixup."""
+    largest = float(torch.finfo(dtype).max)
+    step = local_step(largest, dtype)
+    assert math.isfinite(step)
+    assert step > 0
+    # Same binade, so it is exactly the step below the largest finite.
+    below = _step_down(largest, dtype)
+    assert step == pytest.approx(largest - float(below))
+
+
+def test_a_missing_nan_is_named_rather_than_reported_as_zero_steps():
+    """The defect this guards: a NaN lane is UNMEASURABLE and drops out of the statistics,
+    so a verdict that failed only on a missing NaN used to report "max 0 ULP (budget 0)"
+    — true, and useless to whoever has to fix it."""
+    golden = torch.tensor([1.0, float("nan"), 2.0], dtype=torch.float32)
+    result = torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32)
+    distance = ulp_distance(golden, result)
+
+    assert ulp_stats(distance)["max"] == 0  # the statistics genuinely see nothing
+    summary = nonfinite_disagreement_summary(golden, result, DataFormat.Float32)
+    assert summary is not None
+    assert "non-finite disagreement @ [1]" in summary
+    assert "1 such lane(s)" in summary
+
+    message = ulp_verdict_message(
+        golden, result, distance, DataFormat.Float32, max_ulp=0
+    )
+    assert message.startswith("non-finite disagreement @ [1]")
+    assert "max 0 ULP" in message  # the step summary is still there, as detail
+
+
+def test_an_agreeing_verdict_has_no_disagreement_line():
+    golden = torch.tensor([1.0, float("nan"), float("inf")], dtype=torch.float32)
+    result = golden.clone()
+    assert nonfinite_disagreement_summary(golden, result, DataFormat.Float32) is None
+    message = ulp_verdict_message(
+        golden, result, ulp_distance(golden, result), DataFormat.Float32, max_ulp=0
+    )
+    assert "non-finite disagreement" not in message
+
+
+def test_the_disagreement_count_covers_every_bad_lane():
+    nan = float("nan")
+    golden = torch.tensor([nan, nan, nan, 1.0], dtype=torch.float32)
+    result = torch.tensor([1.0, 2.0, nan, 1.0], dtype=torch.float32)
+    summary = nonfinite_disagreement_summary(golden, result, DataFormat.Float32)
+    assert "@ [0]" in summary and "2 such lane(s)" in summary
+
+
+def test_within_ulp_and_the_gate_describe_a_verdict_the_same_way():
+    """One message builder for both, so the two cannot drift into describing the same
+    failure differently."""
+    golden = torch.tensor([1.0, float("nan")], dtype=torch.float32)
+    result = torch.tensor([1.0, 1.0], dtype=torch.float32)
+    _, from_within_ulp = within_ulp(golden, result, 0, fmt=DataFormat.Float32)
+    from_builder = ulp_verdict_message(
+        golden,
+        result,
+        ulp_distance(golden, result),
+        DataFormat.Float32,
+        mask=torch.ones_like(golden, dtype=torch.bool),
+        max_ulp=0,
+    )
+    assert from_within_ulp == from_builder
+
+
+def test_a_failure_at_the_top_of_the_range_reports_a_usable_step():
+    """Both fixes at once: the overflow names itself, and the step it is measured against
+    is a number rather than infinity."""
+    largest = float(torch.finfo(torch.bfloat16).max)
+    golden = torch.tensor([largest], dtype=torch.bfloat16)
+    result = torch.tensor([float("inf")], dtype=torch.bfloat16)
+    ok, message = within_ulp(golden, result, 4, fmt=DataFormat.Float16_b)
+    assert not ok
+    assert message.startswith("non-finite disagreement")
+    assert "1 ULP = inf" not in message
