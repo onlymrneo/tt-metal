@@ -278,7 +278,8 @@ def has_ulp_gate(fmt: DataFormat) -> bool:
     rather than fail, and the one to ask instead of testing membership of
     :data:`ULP_FORMATS` -- that tuple is only the native half and misses the proxy
     formats, which is how the sweep ended up writing NaN for exactly the format the gate
-    can judge.
+    can judge. The budget registry uses it to keep an enrolled op on the tolerance metric
+    for the formats whose spacing comes from a shared block exponent.
     """
     try:
         ulp_dtype(fmt)
