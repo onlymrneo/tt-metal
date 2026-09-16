@@ -1,0 +1,186 @@
+name: "Single-card tests"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-device-perf:
+        description: "Run the device perf regressions"
+        required: false
+        type: boolean
+        default: true
+      run-profiler:
+        description: "Run the profiler tests"
+        required: false
+        type: boolean
+        default: false
+      run-cpp-unit:
+        description: "Run the cpp unit tests"
+        required: false
+        type: boolean
+        default: false
+      architecture:
+        description: 'Device perf: architectures to test: ["blackhole"], ["wormhole_b0"], or both (default)'
+        required: false
+        type: string
+        default: '["blackhole", "wormhole_b0"]'
+      requested-models:
+        description: 'Device perf: list of requested models as JSON array, for example: ["vit"]. Default is ''all'''
+        required: false
+        type: string
+        default: "all"
+      run-blackhole-profiler:
+        description: "Profiler: Blackhole"
+        required: false
+        type: boolean
+        default: true
+      run-n300-profiler:
+        description: "Profiler: N300"
+        required: false
+        type: boolean
+        default: true
+      run-n150-profiler:
+        description: "Profiler: N150"
+        required: false
+        type: boolean
+        default: true
+      post-commit-only:
+        description: "Profiler: whether to only run tests on post-commit branches (i.e. not on PRs)"
+        required: false
+        type: boolean
+        default: false
+      extra-tag:
+        required: false
+        type: string
+        default: "in-service"
+      platform:
+        required: false
+        type: choice
+        default: "Ubuntu 22.04"
+        options:
+          - "Ubuntu 22.04"
+          - "Ubuntu 24.04"
+        description: "Platform to build and test"
+      build-type:
+        required: false
+        type: choice
+        default: Release
+        options:
+          - Release
+          - Debug
+          - RelWithDebInfo
+          - ASan
+          - TSan
+        description: "Build type configuration"
+      enable-lto:
+        required: false
+        type: boolean
+        default: false
+        description: "Enable Link Time Optimization (LTO)"
+  schedule:
+    - cron: "0 2,7,10,14,17,20,23 * * *"
+
+run-name: "Single-card tests"
+
+jobs:
+  check-harbor:
+    uses: ./.github/workflows/check-harbor.yaml
+
+  # A scheduled run covers the device perf regressions only. The profiler suite
+  # and the cpp unit suite stay opt-in on workflow_dispatch.
+  select-suites:
+    runs-on: ubuntu-slim
+    outputs:
+      run-device-perf: ${{ steps.logic.outputs.run-device-perf }}
+      run-profiler: ${{ steps.logic.outputs.run-profiler }}
+      run-cpp-unit: ${{ steps.logic.outputs.run-cpp-unit }}
+    steps:
+      - name: Select the suites to run
+        id: logic
+        run: |
+          set -e
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "run-device-perf=true" >> $GITHUB_OUTPUT
+            echo "run-profiler=false" >> $GITHUB_OUTPUT
+            echo "run-cpp-unit=false" >> $GITHUB_OUTPUT
+          else
+            echo "run-device-perf=${{ inputs.run-device-perf }}" >> $GITHUB_OUTPUT
+            echo "run-profiler=${{ inputs.run-profiler }}" >> $GITHUB_OUTPUT
+            echo "run-cpp-unit=${{ inputs.run-cpp-unit }}" >> $GITHUB_OUTPUT
+          fi
+
+  compute-skus:
+    needs: select-suites
+    if: ${{ needs.select-suites.outputs.run-profiler == 'true' }}
+    runs-on: ubuntu-slim
+    outputs:
+      enabled-skus: ${{ steps.build.outputs.value }}
+    steps:
+      - name: Determine enabled SKUs
+        id: build
+        run: |
+          set -e
+          parts=()
+          [[ "${{ inputs.run-blackhole-profiler }}" == "true" ]] && parts+=("bh_p100a_civ2_viommu" "bh_p150b_civ2_viommu")
+          [[ "${{ inputs.run-n300-profiler }}" == "true" ]] && parts+=("wh_n300_civ2")
+          [[ "${{ inputs.run-n150-profiler }}" == "true" ]] && parts+=("wh_n150_civ2")
+          skus=$(IFS=,; echo "${parts[*]}")
+          if [[ -z "$skus" ]]; then
+            echo "::error::No SKUs selected. Enable at least one of run-blackhole-profiler / run-n300-profiler / run-n150-profiler."
+            exit 1
+          fi
+          echo "value=$skus" >> "$GITHUB_OUTPUT"
+
+  # The device perf suite and the profiler suite both need a Tracy build, and
+  # the cpp unit suite runs against the same artifact.
+  build-artifact:
+    needs: [check-harbor, select-suites]
+    if: ${{ !cancelled() && needs.select-suites.result == 'success' }}
+    uses: ./.github/workflows/build-artifact.yaml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      harbor-prefix: ${{ needs.check-harbor.outputs.harbor-prefix }}
+      build-type: ${{ inputs.build-type || 'Release' }}
+      tracy: true
+      build-inplace-wheel: true
+      platform: ${{ inputs.platform || 'Ubuntu 22.04' }}
+      enable-lto: ${{ inputs.enable-lto || false }}
+
+  device-perf:
+    needs: [check-harbor, select-suites, build-artifact]
+    if: ${{ !cancelled() && needs.select-suites.outputs.run-device-perf == 'true' && needs.build-artifact.result == 'success' }}
+    secrets: inherit
+    uses: ./.github/workflows/perf-device-models-impl.yaml
+    with:
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
+      extra-tag: ${{ inputs.extra-tag || 'in-service' }}
+      architecture: ${{ inputs.architecture || '["blackhole", "wormhole_b0"]' }}
+      requested-models: ${{ inputs.requested-models || 'all' }}
+
+  single-card-profiler-tests:
+    needs: [select-suites, compute-skus, build-artifact]
+    if: ${{ !cancelled() && needs.select-suites.outputs.run-profiler == 'true' && needs.build-artifact.result == 'success' }}
+    secrets: inherit
+    uses: ./.github/workflows/single-card-profiler-tests-impl.yaml
+    with:
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
+      enabled-skus: ${{ needs.compute-skus.outputs.enabled-skus }}
+      test-selection: ${{ inputs.post-commit-only && 'post-commit' || 'all' }}
+
+  cpp-unit-tests:
+    needs: [select-suites, build-artifact]
+    if: ${{ !cancelled() && needs.select-suites.outputs.run-cpp-unit == 'true' && needs.build-artifact.result == 'success' }}
+    secrets: inherit
+    uses: ./.github/workflows/ops-unit-tests-impl.yaml
+    with:
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
+      enabled-skus: "wh_n300_civ2"
+      additional_test_categories: "cpp_accessor,cpp_lab_examples"

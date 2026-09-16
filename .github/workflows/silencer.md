@@ -140,7 +140,7 @@ safe-outputs:
       - t3000-e2e-tests
       - t3000-integration-tests
       - t3000-profiler-tests
-      - single-card-profiler-tests
+      - single-card-tests
       - pipeline-select-profiler
       - t3000-unit-tests
 
@@ -151,7 +151,6 @@ safe-outputs:
       - models-t3-e2e-tests
       - models-t3-unit-tests
 
-      - perf-device-models
       - tt-metal-l2-nightly
       - vllm-model-tests
       - sanity-tests-debug
