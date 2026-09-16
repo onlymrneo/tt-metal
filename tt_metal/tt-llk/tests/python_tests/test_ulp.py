@@ -33,6 +33,7 @@ import pytest
 import torch
 from helpers.accuracy_metrics import local_ulp
 from helpers.format_config import DataFormat
+from helpers.llk_params import format_dict
 from helpers.pack import float_to_bfp8_block
 from helpers.ulp import (
     _MIN_LANES_FOR_P95,
@@ -44,6 +45,7 @@ from helpers.ulp import (
     UNMEASURABLE,
     _value_order_index,
     flushes_subnormals,
+    has_ulp_gate,
     local_step,
     nonfinite_disagreement_summary,
     nonfinite_mismatches,
@@ -69,6 +71,25 @@ assert float(torch.tensor(1.0, dtype=torch.bfloat16)) - BELOW_ONE == float(
         torch.tensor(1.0, dtype=torch.bfloat16), torch.tensor(0.0, dtype=torch.bfloat16)
     )
 )
+
+TORCH_INT_DTYPES = (
+    torch.int8,
+    torch.uint8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.bool,
+)
+
+# Derived rather than listed, so a format added to the enum later is covered without
+# anyone remembering to add it here. ULP is meaningless for these: the values are exact,
+# adjacent integers are one apart by definition, and "correct" is bit equality. The
+# assertion below keeps the derivation from silently going empty and making every test
+# that uses it vacuous.
+INTEGER_FORMATS = [
+    fmt for fmt, dtype in format_dict.items() if dtype in TORCH_INT_DTYPES
+]
+assert INTEGER_FORMATS, "no integer DataFormats found; the derivation has broken"
 
 # Mantissa bits after the implicit leading 1, i.e. what sets the size of the subnormal
 # band that the flush has to compact away.
@@ -612,9 +633,10 @@ def test_ulp_dtype_maps_the_float_formats(fmt, expected):
         DataFormat.Bfp2_b,
         DataFormat.MxFp8P,
         DataFormat.MxFp4,
-        DataFormat.Int32,
         DataFormat.Tf32,
-    ],
+    ]
+    + INTEGER_FORMATS,
+    ids=lambda f: f.name,
 )
 def test_ulp_dtype_rejects_formats_without_a_per_element_ulp(fmt):
     """Rejected, not silently redirected: Bfp4_b's 3 magnitude bits leave 2 fractional and
@@ -1519,3 +1541,43 @@ def test_the_absolute_near_zero_cut_is_compared_in_float32_not_the_tensor_dtype(
     )
     # The lane is outside the band on both sides of the comparison, so the step fails.
     assert not wide
+# ─────────────────────────────────────────────────────────────────────────────
+# Integers are not ULP territory
+#
+# A step count says "how many representable values apart". For an integer format the
+# answer is always the arithmetic difference, the values are exact, and the only sensible
+# verdict is bit equality — so ULP is not a weaker gate there, it is a meaningless one.
+# Every entry point must refuse rather than compute something plausible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("fmt", INTEGER_FORMATS, ids=lambda f: f.name)
+def test_no_integer_format_is_ulp_gateable(fmt):
+    assert not has_ulp_gate(fmt)
+    assert fmt not in ULP_FORMATS
+    with pytest.raises(  # allow-pytest.raises: no expect_error fixture in LLK suite
+        ValueError, match="no per-element ULP"
+    ):
+        ulp_dtype(fmt)
+
+
+@pytest.mark.parametrize("dtype", TORCH_INT_DTYPES, ids=str)
+def test_the_metric_refuses_every_integer_tensor_dtype(dtype):
+    """Including the containers the float bit arithmetic uses internally: ``torch.int16``
+    is how a bfloat16's bits are read, which must not make an int16 *tensor* measurable.
+    """
+    values = torch.ones(4, dtype=dtype)
+    with pytest.raises(  # allow-pytest.raises: no expect_error fixture in LLK suite
+        ValueError, match="unsupported dtype"
+    ):
+        ulp_distance(values, values.clone())
+
+
+def test_the_bit_containers_are_not_measurable_dtypes():
+    """``_ULP_DTYPES`` is keyed on the float dtypes only. Its *values* name integer dtypes
+    because that is how the bits are viewed; a lookup by one of those must miss."""
+    from helpers.ulp import _ULP_DTYPES
+
+    assert set(_ULP_DTYPES) == set(FLOAT_DTYPES)
+    for dtype in TORCH_INT_DTYPES:
+        assert dtype not in _ULP_DTYPES
