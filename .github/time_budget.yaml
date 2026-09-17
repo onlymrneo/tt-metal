@@ -228,7 +228,7 @@ scaleout:
   e2e:
     wh_llmbox: 185
     wh_galaxy: 100
-    bh_galaxy: 125
+    bh_galaxy: 130  # +5 for galaxy-fabric-2x2-torus-x (#56298 single-galaxy Torus-X regression, ~2.5 min)
     bh_sc1: 20
     bh_sc4: 90
     bh_sc16: 150
