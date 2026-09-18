@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Diagnose groupnorm_tiled_sender's extra scalar at logical [0,16].
+# Each local/global pair exercises both halves of destination memory.
+# Expected [0,0]: local_0=local_1=global_0=global_1=1, half_0=half_1=0.25.
+# All other elements should be zero under the current scalar-reduce contract.
+# For half_0/half_1, a retained first-pool scratch value would be 0.5;
+# a duplicate of the final scalar would instead be 0.25.
+supported_archs: [quasar]
+dest_acc: true
+skip_for_perf: true
+
+loops:
+  mask:
+    in0: {count: 4}
+    in1: [0, 1, 0, 1]
+    dest: [0, 1]
+    out: {count: 4}
+  local_reduce:
+    in0: {count: 4}
+    in1: {count: 4, step: 0}
+    dest: [0, 0, 0, 0]
+  scalar:
+    in0: [0]
+    in1: [0]
+    dest: [0]
+    out: [0]
+
+operands:
+  - {name: x, dims: [64, 64], format: Float16_b, const_value: 1.0}
+  - {name: input_mask, dims: [32, 64], format: Float32, const_value: 1.0}
+  - {name: scaler_local, dims: [32, 32], format: Float16_b, const_value: 0.015625}
+  - {name: scaler_unit, dims: [32, 32], format: Float16_b, const_value: 1.0}
+  - {name: scaler_half, dims: [32, 32], format: Float16_b, const_value: 0.5}
+  - {name: masked, dims: [64, 64], format: Float16_b}
+  - {name: local_0, dims: [32, 32], format: Float16_b}
+  - {name: local_1, dims: [32, 32], format: Float16_b}
+  - {name: global_0, dims: [32, 32], format: Float16_b}
+  - {name: global_1, dims: [32, 32], format: Float16_b}
+  - {name: half_0, dims: [32, 32], format: Float16_b}
+  - {name: half_1, dims: [32, 32], format: Float16_b}
+
+operations:
+  # Preserve the mixed-format mask stage preceding groupnorm's first reduction.
+  - math:
+      - type: Fpu
+        operation: Elwmul
+        unpacker: UnpackerAB
+        broadcast_type: ROW
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: x
+        in1: input_mask
+        loop: mask
+    pack:
+      - {output: masked, block_size: [32, 32], loop: mask}
+
+  # Four-tile scaled local reduction, repeated on the other destination half.
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: masked
+        in1: scaler_local
+        loop: local_reduce
+    pack:
+      - {output: local_0, block_size: [32, 32], loop: scalar}
+
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: masked
+        in1: scaler_local
+        loop: local_reduce
+    pack:
+      - {output: local_1, block_size: [32, 32], loop: scalar}
+
+  # Reuse the SAME local input on both halves to isolate destination-bank effects.
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: local_0
+        in1: scaler_unit
+        loop: scalar
+    pack:
+      - {output: global_0, block_size: [32, 32], loop: scalar}
+
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: local_0
+        in1: scaler_unit
+        loop: scalar
+    pack:
+      - {output: global_1, block_size: [32, 32], loop: scalar}
+
+  # Half scaling distinguishes the first-pool intermediate from the final scalar.
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: local_0
+        in1: scaler_half
+        loop: scalar
+    pack:
+      - {output: half_0, block_size: [32, 32], loop: scalar}
+
+  - math:
+      - type: Fpu
+        operation: Reduce
+        unpacker: ReduceUnpacker
+        reduce_dim: REDUCE_SCALAR
+        reduce_pool: SUM
+        math_fidelity: HiFi4
+        block_size: [32, 32]
+        in0: local_0
+        in1: scaler_half
+        loop: scalar
+    pack:
+      - {output: half_1, block_size: [32, 32], loop: scalar}
