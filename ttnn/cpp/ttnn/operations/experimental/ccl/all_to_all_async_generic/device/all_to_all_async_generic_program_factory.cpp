@@ -325,11 +325,6 @@ AllToAllAsyncGenericProgram::cached_mesh_workload_t AllToAllAsyncGenericProgram:
     const auto& input = tensor_args.input_tensor;
     const auto discovered_num_links =
         static_cast<uint32_t>(ttnn::operations::ccl::common::get_num_links(*mesh_device, args.cluster_axis));
-    TT_FATAL(
-        !args.num_links.has_value() || *args.num_links <= discovered_num_links,
-        "all_to_all_async requested {} links, but only {} usable links were discovered",
-        args.num_links.value_or(0),
-        discovered_num_links);
     const uint32_t num_links = args.num_links.value_or(discovered_num_links);
     TT_FATAL(num_links > 0, "all_to_all_async requires at least one fabric link");
     TT_FATAL(
