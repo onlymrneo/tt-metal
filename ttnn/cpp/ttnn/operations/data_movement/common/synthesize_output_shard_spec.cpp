@@ -43,19 +43,27 @@ ShardSpec synthesize_output_shard_spec(
     const CoreRangeSet all_cores(CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1}));
     const uint32_t num_cores = all_cores.num_cores();
     TT_FATAL(num_cores > 0, "{}: empty compute grid.", opts.caller_tag);
-    // Guards `div_up(_, shard_shape[i])` below; repeat's soft-reject path never reaches here (see
-    // repeat_utils.cpp:202).
-    TT_FATAL(
-        tensor_height > 0 && tensor_width > 0,
-        "{}: tensor dims must be > 0; got ({}, {}).",
-        opts.caller_tag,
-        tensor_height,
-        tensor_width);
 
     const ShardOrientation orientation = resolve_orientation(opts);
     const bool row_wise = (orientation == ShardOrientation::ROW_MAJOR);
     const uint32_t h_align = opts.is_tile ? tt::constants::TILE_HEIGHT : 1u;
     const uint32_t w_align = opts.is_tile ? tt::constants::TILE_WIDTH : 1u;
+
+    // Zero-volume: TensorSpec checks (tensor_spec.cpp:41-99) require shard_w == physical_w for HEIGHT
+    // and shard_h == physical_h for WIDTH, so shape the degenerate spec by layout, not a naive tile.
+    if (tensor_height == 0 || tensor_width == 0) {
+        uint32_t sh = h_align;
+        uint32_t sw = w_align;
+        if (memory_layout == TensorMemoryLayout::HEIGHT_SHARDED) {
+            sw = static_cast<uint32_t>(tt::round_up(std::max<uint64_t>(tensor_width, 1u), w_align));
+        } else if (memory_layout == TensorMemoryLayout::WIDTH_SHARDED) {
+            sh = static_cast<uint32_t>(tt::round_up(std::max<uint64_t>(tensor_height, 1u), h_align));
+        } else {
+            sh = static_cast<uint32_t>(tt::round_up(std::max<uint64_t>(tensor_height, 1u), h_align));
+            sw = static_cast<uint32_t>(tt::round_up(std::max<uint64_t>(tensor_width, 1u), w_align));
+        }
+        return ShardSpec(CoreRangeSet(CoreRange({0, 0}, {0, 0})), {sh, sw}, orientation);
+    }
 
     std::array<uint32_t, 2> shard_shape = {0, 0};
     if (memory_layout == TensorMemoryLayout::HEIGHT_SHARDED) {
