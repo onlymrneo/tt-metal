@@ -77,7 +77,7 @@ on:
         default: false
         description: "Enable Link Time Optimization (LTO)"
   schedule:
-    - cron: "0 2,7,10,14,17,20,23 * * *"
+    - cron: "0 2 * * *" # runs every day at 2am UTC
 
 run-name: "Single-card tests"
 
